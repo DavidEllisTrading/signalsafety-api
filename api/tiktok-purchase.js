@@ -1,7 +1,7 @@
 import crypto from "crypto";
 
 export default async function handler(req, res) {
-  // CORS (för browser-test)
+  // CORS (bara för att du ska kunna testa från browsern)
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "POST,OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
@@ -9,30 +9,19 @@ export default async function handler(req, res) {
   // Preflight
   if (req.method === "OPTIONS") return res.status(200).end();
 
-  // Only POST
+  // Endast POST
   if (req.method !== "POST") {
     return res.status(405).json({ error: "Method not allowed" });
   }
 
-  // ✅ FINGERPRINT (temporärt) — bevisar att denna deploy körs
-  return res.status(200).json({
-    fingerprint: "BUILD_2026_03_01_1909",
-    env: {
-      hasAccessToken: Boolean(process.env.TIKTOK_ACCESS_TOKEN),
-      hasPixelCode: Boolean(process.env.TIKTOK_PIXEL_CODE),
-    },
-  });
-
-  // ------------------------------------------------------------
-  // När fingerprint stämmer: kommentera bort returnen ovan
-  // ------------------------------------------------------------
-
   try {
+    // Minimal log så du ser att Shopify/webhooken kom in
     console.log("INCOMING", {
       method: req.method,
       path: req.url,
-      shopify_topic: req.headers["x-shopify-topic"],
+      topic: req.headers["x-shopify-topic"],
       webhook_id: req.headers["x-shopify-webhook-id"],
+      ua: req.headers["user-agent"],
     });
 
     const {
@@ -43,8 +32,8 @@ export default async function handler(req, res) {
       email,
       phone,
       ttclid,
-      timestamp,
-      test_event_code,
+      timestamp,        // optional
+      test_event_code,  // optional (för TikTok Test Events)
     } = req.body || {};
 
     function sha256(v) {
@@ -55,44 +44,48 @@ export default async function handler(req, res) {
         .digest("hex");
     }
 
-    // TikTok vill ha sekunder (int)
+    // TikTok vill ha unix timestamp i sekunder.
+    // Skicka som STRING för att undvika 40002 ("not a valid string")
     const ts = Number.isFinite(Number(timestamp))
       ? Math.floor(Number(timestamp))
       : Math.floor(Date.now() / 1000);
 
-    const pixelCode = process.env.TIKTOK_PIXEL_CODE || "D6FG1F3C77UF3AJEJKKG";
+    const pixelCode = (process.env.TIKTOK_PIXEL_CODE || "").trim() || "D6FG1F3C77UF3AJEJKKG";
+    const accessToken = (process.env.TIKTOK_ACCESS_TOKEN || "").trim();
 
     const payload = {
       pixel_code: pixelCode,
-      event: "CompletePayment",
-      timestamp: ts,
+      event: "Purchase",
+      timestamp: String(ts),
       event_id: String(event_id || order_id || crypto.randomUUID()),
-      context: ttclid ? { ad: { callback: ttclid } } : undefined,
+      test_event_code: test_event_code ? String(test_event_code) : undefined,
+
+      // TikTok click id (om du har den)
+      context: ttclid ? { ad: { callback: String(ttclid) } } : undefined,
+
       user: {
         email: email ? sha256(email) : undefined,
         phone: phone ? sha256(phone) : undefined,
       },
+
       properties: {
         currency: currency || "SEK",
         value: Number(value || 0),
       },
-      // om du kör TikTok Test Events
-      test_event_code: test_event_code ? String(test_event_code) : undefined,
     };
 
     console.log("TIKTOK_PAYLOAD", payload);
+    console.log("PIXEL_CODE_USED", pixelCode);
+    console.log("ACCESS_TOKEN_FIRST_6", accessToken ? accessToken.slice(0, 6) : "MISSING");
 
-    const response = await fetch(
-      "https://business-api.tiktok.com/open_api/v1.3/pixel/track/",
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "Access-Token": process.env.TIKTOK_ACCESS_TOKEN,
-        },
-        body: JSON.stringify(payload),
-      }
-    );
+    const response = await fetch("https://business-api.tiktok.com/open_api/v1.3/pixel/track/", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Access-Token": accessToken,
+      },
+      body: JSON.stringify(payload),
+    });
 
     const data = await response.json();
 
