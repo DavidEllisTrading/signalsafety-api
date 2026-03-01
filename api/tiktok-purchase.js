@@ -17,7 +17,8 @@ export default async function handler(req, res) {
   }
 
   try {
-    const { event_id, order_id, currency, value, email, phone, ttclid } = req.body || {};
+    const { event_id, order_id, currency, value, email, phone, ttclid } =
+      req.body || {};
 
     function sha256(v) {
       if (!v) return null;
@@ -30,7 +31,7 @@ export default async function handler(req, res) {
     const payload = {
       pixel_code: "D6FG1F3C77UF3AJEJKKG",
       event: "CompletePayment",
-      timestamp: Math.floor(Date.now() / 1000),
+      timestamp: String(Math.floor(Date.now() / 1000)), // FIX: must be string
       event_id: String(event_id || order_id || crypto.randomUUID()),
       context: ttclid ? { ad: { callback: ttclid } } : undefined,
       user: {
@@ -39,18 +40,21 @@ export default async function handler(req, res) {
       },
       properties: {
         currency: currency || "SEK",
-        value: Number(value || 0),
+        value: String(Number(value || 0)), // safer as string
       },
     };
 
-    const response = await fetch("https://business-api.tiktok.com/open_api/v1.3/pixel/track/", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Access-Token": process.env.TIKTOK_ACCESS_TOKEN,
-      },
-      body: JSON.stringify(payload),
-    });
+    const response = await fetch(
+      "https://business-api.tiktok.com/open_api/v1.3/pixel/track/",
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Access-Token": process.env.TIKTOK_ACCESS_TOKEN,
+        },
+        body: JSON.stringify(payload),
+      }
+    );
 
     const data = await response.json();
     return res.status(200).json({ ok: true, tiktok: data });
