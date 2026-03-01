@@ -1,7 +1,7 @@
 import crypto from "crypto";
 
 export default async function handler(req, res) {
-  // CORS (bara för browser-test)
+  // CORS för browser-test
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "POST,OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
@@ -10,87 +10,63 @@ export default async function handler(req, res) {
   if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
 
   try {
-    console.log("INCOMING", {
-      method: req.method,
-      path: req.url,
-      shopify_topic: req.headers["x-shopify-topic"],
-      webhook_id: req.headers["x-shopify-webhook-id"],
-    });
-
     const body = req.body || {};
 
-    // Shopify orders/paid webhook har INTE dina egna fält som event_id/value/email osv,
-    // så vi plockar smart från Shopify payload.
-    const orderId = body.id || body.order_id || body.admin_graphql_api_id || body.name;
-    const currency = body.currency || body.presentment_currency || "SEK";
+    // ---- DEBUG: visa exakt vad som kommer in
+    console.log("INCOMING_BODY_KEYS", Object.keys(body));
+    console.log("INCOMING_TIMESTAMP_RAW", body.timestamp, typeof body.timestamp);
 
-    // Shopify: total_price / current_total_price kan vara sträng
-    const rawValue =
-      body.current_total_price ??
-      body.total_price ??
-      body.total_price_set?.shop_money?.amount ??
-      body.current_total_price_set?.shop_money?.amount ??
-      body.total_price_set?.presentment_money?.amount ??
-      body.current_total_price_set?.presentment_money?.amount;
-
-    const value = Number(rawValue || 0);
-
-    const email = body.email || body.contact_email || body.customer?.email;
-    const phone = body.phone || body.customer?.phone || body.shipping_address?.phone;
-
-    // Om du testar manuellt via fetch kan du skicka dessa
-    const ttclid = body.ttclid; // valfritt
-    const test_event_code = body.test_event_code; // VIKTIG för Test Events
-    const timestamp = body.timestamp; // valfritt
+    const {
+      test_event_code,
+      event_id,
+      order_id,
+      currency,
+      value,
+      email,
+      phone,
+      ttclid,
+      timestamp, // optional
+    } = body;
 
     function sha256(v) {
       if (!v) return undefined;
-      return crypto.createHash("sha256").update(String(v).trim().toLowerCase()).digest("hex");
+      return crypto
+        .createHash("sha256")
+        .update(String(v).trim().toLowerCase())
+        .digest("hex");
     }
 
-    // TikTok vill ha sekunder (int)
-    const ts = Number.isFinite(Number(timestamp))
-      ? Math.floor(Number(timestamp))
-      : Math.floor(Date.now() / 1000);
+    // TikTok: skicka ALLTID timestamp som int (sekunder)
+    const ts =
+      typeof timestamp === "number"
+        ? Math.floor(timestamp)
+        : typeof timestamp === "string" && timestamp.trim() !== "" && !Number.isNaN(Number(timestamp))
+          ? Math.floor(Number(timestamp))
+          : Math.floor(Date.now() / 1000);
 
-    const pixel_code = process.env.TIKTOK_PIXEL_CODE || "D6FG1F3C77UF3AJEJKKG";
+    // EXTRA DEBUG: logga vad vi skickar
+    console.log("TIMESTAMP_COMPUTED", ts, typeof ts);
 
     const payload = {
-      pixel_code,
-      event: "Purchase",                // <-- DETTA gör att det blir “Purchase” i UI
+      pixel_code: process.env.TIKTOK_PIXEL_CODE, // sätt i Vercel
+      event: "Purchase", // viktig: TikTok standard-event för köp
       timestamp: ts,
-      event_id: String(orderId || crypto.randomUUID()),
-
-      // test_event_code gör att server-event syns i “Test events”
-      ...(test_event_code ? { test_event_code } : {}),
-
+      event_id: String(event_id || order_id || crypto.randomUUID()),
+      test_event_code: test_event_code || undefined,
       context: ttclid ? { ad: { callback: ttclid } } : undefined,
-
       user: {
         email: email ? sha256(email) : undefined,
         phone: phone ? sha256(phone) : undefined,
       },
-
       properties: {
-        currency,
-        value,
+        currency: currency || "SEK",
+        value: Number(value || 0),
       },
     };
 
-    console.log("TIKTOK_PAYLOAD", {
-      pixel_code,
-      event: payload.event,
-      timestamp: payload.timestamp,
-      event_id: payload.event_id,
-      currency: payload.properties.currency,
-      value: payload.properties.value,
-      hasTestEventCode: !!test_event_code,
-      hasEmail: !!email,
-      hasPhone: !!phone,
-      hasTtclid: !!ttclid,
-    });
+    console.log("TIKTOK_PAYLOAD", payload);
 
-    const response = await fetch("https://business-api.tiktok.com/open_api/v1.3/pixel/track/", {
+    const resp = await fetch("https://business-api.tiktok.com/open_api/v1.3/pixel/track/", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -99,13 +75,13 @@ export default async function handler(req, res) {
       body: JSON.stringify(payload),
     });
 
-    const data = await response.json();
+    const data = await resp.json();
 
-    console.log("TIKTOK_RESPONSE", { http_status: response.status, data });
+    console.log("TIKTOK_RESPONSE", { http_status: resp.status, data });
 
     return res.status(200).json({ ok: true, tiktok: data });
-  } catch (error) {
-    console.error("ERROR", error);
-    return res.status(500).json({ ok: false, error: String(error) });
+  } catch (e) {
+    console.error("ERROR", e);
+    return res.status(500).json({ ok: false, error: String(e) });
   }
 }
