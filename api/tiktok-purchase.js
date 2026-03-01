@@ -1,21 +1,30 @@
 import crypto from "crypto";
 
 export default async function handler(req, res) {
-  // CORS
+  // CORS (för browser-test; du kan låsa senare)
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "POST,OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
 
+  // Preflight
   if (req.method === "OPTIONS") return res.status(200).end();
-  if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
+
+  // Only POST
+  if (req.method !== "POST") {
+    return res.status(405).json({ error: "Method not allowed" });
+  }
 
   try {
+    // Logga inkommande webhook/request
     console.log("INCOMING", {
       method: req.method,
       path: req.url,
       shopify_topic: req.headers["x-shopify-topic"],
       webhook_id: req.headers["x-shopify-webhook-id"],
+      ua: req.headers["user-agent"],
     });
+
+    const body = req.body || {};
 
     const {
       event_id,
@@ -25,8 +34,9 @@ export default async function handler(req, res) {
       email,
       phone,
       ttclid,
+      // valfritt: om du skickar timestamp själv
       timestamp,
-    } = req.body || {};
+    } = body;
 
     function sha256(v) {
       if (!v) return undefined;
@@ -36,14 +46,24 @@ export default async function handler(req, res) {
         .digest("hex");
     }
 
-    const ts = Number.isFinite(Number(timestamp))
+    // TikTok vill ha unix timestamp i SEKUNDER
+    // och i din setup kräver den STRING (inte number)
+    const tsNum = Number.isFinite(Number(timestamp))
       ? Math.floor(Number(timestamp))
       : Math.floor(Date.now() / 1000);
 
+    const pixelCode = process.env.TIKTOK_PIXEL_CODE || "D6FG1F3C77UF3AJEJKKG";
+    const accessToken = process.env.TIKTOK_ACCESS_TOKEN;
+
+    // Viktigt: access token måste finnas
+    if (!accessToken) {
+      return res.status(500).json({ ok: false, error: "Missing TIKTOK_ACCESS_TOKEN in env" });
+    }
+
     const payload = {
-      pixel_code: process.env.TIKTOK_PIXEL_CODE || "D6FG1F3C77UF3AJEJKKG",
+      pixel_code: pixelCode,
       event: "CompletePayment",
-      timestamp: ts,
+      timestamp: String(tsNum), // ✅ FIX: string, inte number
       event_id: String(event_id || order_id || crypto.randomUUID()),
       context: ttclid ? { ad: { callback: ttclid } } : undefined,
       user: {
@@ -56,22 +76,19 @@ export default async function handler(req, res) {
       },
     };
 
-    // 🔍 DEBUG LOGGAR
-    console.log("PIXEL_CODE_USED:", JSON.stringify(payload.pixel_code));
-    console.log("ACCESS_TOKEN_FIRST_6:", process.env.TIKTOK_ACCESS_TOKEN?.slice(0, 6));
-    console.log("FULL_PAYLOAD:", payload);
+    // Debug: visa vad du skickar (men ingen access token)
+    console.log("PIXEL_CODE_USED", pixelCode);
+    console.log("ACCESS_TOKEN_FIRST_6", String(accessToken).slice(0, 6));
+    console.log("FULL_PAYLOAD", payload);
 
-    const response = await fetch(
-      "https://business-api.tiktok.com/open_api/v1.3/pixel/track/",
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "Access-Token": process.env.TIKTOK_ACCESS_TOKEN,
-        },
-        body: JSON.stringify(payload),
-      }
-    );
+    const response = await fetch("https://business-api.tiktok.com/open_api/v1.3/pixel/track/", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Access-Token": accessToken,
+      },
+      body: JSON.stringify(payload),
+    });
 
     const data = await response.json();
 
@@ -80,6 +97,8 @@ export default async function handler(req, res) {
       data,
     });
 
+    // Returnera alltid 200 till Shopify så den inte spammar retries,
+    // men du ser i logs om TikTok gav error code.
     return res.status(200).json({ ok: true, tiktok: data });
   } catch (error) {
     console.error("ERROR", error);
