@@ -1,23 +1,41 @@
 import crypto from "crypto";
 
 export default async function handler(req, res) {
-  // CORS för browser-test
+  // CORS (för browser-test)
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "POST,OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
 
+  // Preflight
   if (req.method === "OPTIONS") return res.status(200).end();
-  if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
+
+  // Only POST
+  if (req.method !== "POST") {
+    return res.status(405).json({ error: "Method not allowed" });
+  }
+
+  // ✅ FINGERPRINT (temporärt) — bevisar att denna deploy körs
+  return res.status(200).json({
+    fingerprint: "BUILD_2026_03_01_1909",
+    env: {
+      hasAccessToken: Boolean(process.env.TIKTOK_ACCESS_TOKEN),
+      hasPixelCode: Boolean(process.env.TIKTOK_PIXEL_CODE),
+    },
+  });
+
+  // ------------------------------------------------------------
+  // När fingerprint stämmer: kommentera bort returnen ovan
+  // ------------------------------------------------------------
 
   try {
-    const body = req.body || {};
-
-    // ---- DEBUG: visa exakt vad som kommer in
-    console.log("INCOMING_BODY_KEYS", Object.keys(body));
-    console.log("INCOMING_TIMESTAMP_RAW", body.timestamp, typeof body.timestamp);
+    console.log("INCOMING", {
+      method: req.method,
+      path: req.url,
+      shopify_topic: req.headers["x-shopify-topic"],
+      webhook_id: req.headers["x-shopify-webhook-id"],
+    });
 
     const {
-      test_event_code,
       event_id,
       order_id,
       currency,
@@ -25,8 +43,9 @@ export default async function handler(req, res) {
       email,
       phone,
       ttclid,
-      timestamp, // optional
-    } = body;
+      timestamp,
+      test_event_code,
+    } = req.body || {};
 
     function sha256(v) {
       if (!v) return undefined;
@@ -36,23 +55,18 @@ export default async function handler(req, res) {
         .digest("hex");
     }
 
-    // TikTok: skicka ALLTID timestamp som int (sekunder)
-    const ts =
-      typeof timestamp === "number"
-        ? Math.floor(timestamp)
-        : typeof timestamp === "string" && timestamp.trim() !== "" && !Number.isNaN(Number(timestamp))
-          ? Math.floor(Number(timestamp))
-          : Math.floor(Date.now() / 1000);
+    // TikTok vill ha sekunder (int)
+    const ts = Number.isFinite(Number(timestamp))
+      ? Math.floor(Number(timestamp))
+      : Math.floor(Date.now() / 1000);
 
-    // EXTRA DEBUG: logga vad vi skickar
-    console.log("TIMESTAMP_COMPUTED", ts, typeof ts);
+    const pixelCode = process.env.TIKTOK_PIXEL_CODE || "D6FG1F3C77UF3AJEJKKG";
 
     const payload = {
-      pixel_code: process.env.TIKTOK_PIXEL_CODE, // sätt i Vercel
-      event: "Purchase", // viktig: TikTok standard-event för köp
+      pixel_code: pixelCode,
+      event: "CompletePayment",
       timestamp: ts,
       event_id: String(event_id || order_id || crypto.randomUUID()),
-      test_event_code: test_event_code || undefined,
       context: ttclid ? { ad: { callback: ttclid } } : undefined,
       user: {
         email: email ? sha256(email) : undefined,
@@ -62,26 +76,34 @@ export default async function handler(req, res) {
         currency: currency || "SEK",
         value: Number(value || 0),
       },
+      // om du kör TikTok Test Events
+      test_event_code: test_event_code ? String(test_event_code) : undefined,
     };
 
     console.log("TIKTOK_PAYLOAD", payload);
 
-    const resp = await fetch("https://business-api.tiktok.com/open_api/v1.3/pixel/track/", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Access-Token": process.env.TIKTOK_ACCESS_TOKEN,
-      },
-      body: JSON.stringify(payload),
+    const response = await fetch(
+      "https://business-api.tiktok.com/open_api/v1.3/pixel/track/",
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Access-Token": process.env.TIKTOK_ACCESS_TOKEN,
+        },
+        body: JSON.stringify(payload),
+      }
+    );
+
+    const data = await response.json();
+
+    console.log("TIKTOK_RESPONSE", {
+      http_status: response.status,
+      data,
     });
 
-    const data = await resp.json();
-
-    console.log("TIKTOK_RESPONSE", { http_status: resp.status, data });
-
     return res.status(200).json({ ok: true, tiktok: data });
-  } catch (e) {
-    console.error("ERROR", e);
-    return res.status(500).json({ ok: false, error: String(e) });
+  } catch (error) {
+    console.error("ERROR", error);
+    return res.status(500).json({ ok: false, error: String(error) });
   }
 }
