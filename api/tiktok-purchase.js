@@ -1,7 +1,7 @@
 import crypto from "crypto";
 
 export default async function handler(req, res) {
-  // CORS (bara för browser-test)
+  // CORS för browser-test
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "POST,OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
@@ -10,89 +10,93 @@ export default async function handler(req, res) {
   if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
 
   try {
-    // Logga headers så vi direkt ser om det är Shopify eller browser
+    const topic = req.headers["x-shopify-topic"];
+    const webhookId = req.headers["x-shopify-webhook-id"];
+
     console.log("INCOMING", {
       method: req.method,
       path: req.url,
       ua: req.headers["user-agent"],
-      shopify_topic: req.headers["x-shopify-topic"],
-      webhook_id: req.headers["x-shopify-webhook-id"],
+      shopify_topic: topic,
+      webhook_id: webhookId,
     });
 
     const body = req.body || {};
 
-    // ---- 1) Läs data från Shopify webhook (order payload) ----
-    // Shopify order har ofta: id, order_number, total_price, currency, email, phone
-    const shopifyOrderId = body.id || body.order_id || body.admin_graphql_api_id;
-    const shopifyValue =
-      body.total_price ??
-      body.current_total_price ??
-      body.total_price_set?.shop_money?.amount ??
-      body.current_total_price_set?.shop_money?.amount;
-
-    const shopifyCurrency =
-      body.currency ??
-      body.currency_code ??
-      body.total_price_set?.shop_money?.currency_code ??
-      body.current_total_price_set?.shop_money?.currency_code;
-
-    const shopifyEmail = body.email;
-    const shopifyPhone = body.phone;
-
-    // ---- 2) Läs data från browser-test (din custom payload) ----
-    const browserEventId = body.event_id;
-    const browserOrderId = body.order_id;
-    const browserValue = body.value;
-    const browserCurrency = body.currency;
-    const browserEmail = body.email;
-    const browserPhone = body.phone;
-    const ttclid = body.ttclid;
-    const timestamp = body.timestamp;
-
-    // Prioritera Shopify om det finns, annars browser
-    const orderId = String(shopifyOrderId || browserOrderId || "");
-    const valueRaw = shopifyValue ?? browserValue ?? 0;
-    const currency = shopifyCurrency || browserCurrency || "SEK";
-    const email = shopifyEmail || browserEmail;
-    const phone = shopifyPhone || browserPhone;
-
-    // TikTok vill ha sekunder (int)
-    const ts = Number.isFinite(Number(timestamp))
-      ? Math.floor(Number(timestamp))
-      : Math.floor(Date.now() / 1000);
-
-    function sha256(v) {
+    // ---------- Helpers ----------
+    const sha256 = (v) => {
       if (!v) return undefined;
-      return crypto
-        .createHash("sha256")
-        .update(String(v).trim().toLowerCase())
-        .digest("hex");
+      return crypto.createHash("sha256").update(String(v).trim().toLowerCase()).digest("hex");
+    };
+
+    const nowSec = () => Math.floor(Date.now() / 1000);
+
+    // ---------- Detect payload type ----------
+    const looksLikeShopifyOrder = body && (body.id || body.order_number || body.total_price);
+
+    // ---------- Extract fields ----------
+    let order_id, currency, value, email, phone, ttclid, event_id, timestamp;
+
+    if (looksLikeShopifyOrder) {
+      // Shopify order payload
+      order_id = String(body.id || body.order_number);
+      currency = body.currency || body.presentment_currency || "SEK";
+      value = Number(body.total_price || 0);
+
+      email = body.email || (body.customer && body.customer.email) || undefined;
+      phone =
+        body.phone ||
+        (body.customer && body.customer.phone) ||
+        (body.shipping_address && body.shipping_address.phone) ||
+        undefined;
+
+      // TikTok click id brukar INTE komma i webhooken om du inte sparar den själv i order attributes/metafields.
+      // Om du sparar den i "note_attributes" så plockar vi den här:
+      if (Array.isArray(body.note_attributes)) {
+        const found = body.note_attributes.find((x) => (x?.name || "").toLowerCase() === "ttclid");
+        ttclid = found?.value;
+      }
+
+      event_id = order_id;
+      timestamp = nowSec();
+    } else {
+      // Browser-test payload (din JSON)
+      order_id = body.order_id;
+      currency = body.currency || "SEK";
+      value = Number(body.value || 0);
+      email = body.email;
+      phone = body.phone;
+      ttclid = body.ttclid;
+      event_id = body.event_id || order_id || crypto.randomUUID();
+      timestamp = Number.isFinite(Number(body.timestamp)) ? Math.floor(Number(body.timestamp)) : nowSec();
     }
 
-    const eventId = String(browserEventId || orderId || crypto.randomUUID());
-    const value = Number(valueRaw || 0);
+    // ---------- Build TikTok payload ----------
+    const pixel_code = process.env.TIKTOK_PIXEL_CODE || "D6FG1F3C77UF3AJEJKKG";
+    const accessToken = process.env.TIKTOK_ACCESS_TOKEN;
 
-    // Stoppa skräp: om webhook kommer men saknar value -> logga & avbryt
-    if (!value || value <= 0) {
-      console.warn("ABORT: Missing/invalid value", { valueRaw, body_keys: Object.keys(body || {}) });
-      return res.status(400).json({ ok: false, error: "Missing/invalid order value" });
+    if (!accessToken) {
+      return res.status(500).json({ ok: false, error: "Missing TIKTOK_ACCESS_TOKEN env var" });
     }
 
-    const payload = {
-      pixel_code: process.env.TIKTOK_PIXEL_CODE || "D6FG1F3C77UF3AJEJKKG",
+    const tiktokEvent = {
       event: "CompletePayment",
-      timestamp: ts,
-      event_id: eventId,
-      context: ttclid ? { ad: { callback: ttclid } } : undefined,
-      user: {
-        email: email ? sha256(email) : undefined,
-        phone: phone ? sha256(phone) : undefined,
-      },
+      event_time: timestamp,          // TikTok: seconds
+      event_id: String(event_id),
+      pixel_code,
       properties: {
         currency,
         value,
       },
+      user: {
+        email: email ? sha256(email) : undefined,
+        phone: phone ? sha256(phone) : undefined,
+      },
+      context: ttclid ? { ad: { callback: ttclid } } : undefined,
     };
+
+    // TikTok endpoint vill oftast ha data-array
+    const payload = { data: [tiktokEvent] };
 
     console.log("TIKTOK_PAYLOAD", payload);
 
@@ -100,7 +104,7 @@ export default async function handler(req, res) {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "Access-Token": process.env.TIKTOK_ACCESS_TOKEN,
+        "Access-Token": accessToken,
       },
       body: JSON.stringify(payload),
     });
@@ -109,14 +113,10 @@ export default async function handler(req, res) {
 
     console.log("TIKTOK_RESPONSE", { http_status: response.status, data });
 
-    // Returnera tydligt så du ser i Shopify delivery också
     return res.status(200).json({
       ok: true,
-      source: req.headers["x-shopify-topic"] ? "shopify_webhook" : "browser",
-      event_id: eventId,
-      order_id: orderId || null,
-      value,
-      currency,
+      source: looksLikeShopifyOrder ? "shopify" : "browser",
+      order_id,
       tiktok: data,
     });
   } catch (error) {
